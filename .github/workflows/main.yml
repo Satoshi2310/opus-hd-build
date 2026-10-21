@@ -1,0 +1,84 @@
+name: Build Opus HD (Windows x64)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      - name: Download Opus source
+        shell: pwsh
+        run: git clone --depth 1 https://github.com/xiph/opus.git opus-source
+
+      - name: Configure CMake with QEXT enabled
+        shell: pwsh
+        run: |
+          cmake -S opus-source -B opus-source/build -A x64 `
+            -DOPUS_BUILD_PROGRAMS=ON `
+            -DOPUS_STATIC_RUNTIME=ON `
+            "-DCMAKE_C_FLAGS=/DENABLE_QEXT"
+
+      - name: Build Release binaries
+        shell: pwsh
+        run: cmake --build opus-source/build --config Release --parallel
+
+      - name: Verify QEXT encode/decode
+        shell: pwsh
+        run: |
+          $exe = ".\opus-source\build\Release\opus_demo.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Build did not produce opus_demo.exe"
+          }
+
+          # Create one second of silent 96 kHz, stereo, float32 PCM.
+          $input = Join-Path $env:RUNNER_TEMP "opus-hd-test.f32"
+          $encoded = Join-Path $env:RUNNER_TEMP "opus-hd-test.bit"
+          $decoded = Join-Path $env:RUNNER_TEMP "opus-hd-test-decoded.f32"
+          $pcm = [byte[]]::new(96000 * 2 * 4)
+          [System.IO.File]::WriteAllBytes($input, $pcm)
+
+          & $exe -e audio 96000 2 1024000 -f32 -cbr -qext $input $encoded
+          if ($LASTEXITCODE -ne 0) { throw "QEXT encoding test failed (exit $LASTEXITCODE)" }
+          if (-not (Test-Path $encoded) -or (Get-Item $encoded).Length -eq 0) {
+            throw "Encoder did not produce a bitstream"
+          }
+
+          & $exe -d 96000 2 -f32 $encoded $decoded
+          if ($LASTEXITCODE -ne 0) { throw "QEXT decoding test failed (exit $LASTEXITCODE)" }
+          if (-not (Test-Path $decoded) -or (Get-Item $decoded).Length -eq 0) {
+            throw "Decoder did not produce PCM output"
+          }
+
+          Write-Output "QEXT encode/decode test passed."
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item .\opus-source\build\Release\opus_demo.exe .\artifact\
+          @"
+          Opus HD (QEXT) reference encoder/decoder
+
+          Built from the xiph/opus GitHub source on a Windows x64 runner.
+          QEXT is enabled at compile time, and a 96 kHz encode/decode smoke test passed.
+
+          opus_demo reads/writes raw PCM and the Opus reference bitstream format.
+          Its .bit output is not an Ogg Opus music file and is not directly playable in foobar2000.
+          "@ | Set-Content -Encoding utf8 .\artifact\README.txt
+
+      - name: Upload Windows x64 binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: opus-hd-windows-x64
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
